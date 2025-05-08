@@ -215,6 +215,7 @@ class BadmintonAnalysisAgent:
             self.agent,
             [{"role": "user", "content": batch_content}]
         )
+        print(result.final_output.reason)
         
         # Convert dataclass to dictionary format for compatibility with existing code
         rallies = []
