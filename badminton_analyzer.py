@@ -128,23 +128,13 @@ init_content = [
     },
     {
         "type": "input_text",
-        "text": """These are continuous frame images. Answer the frames in a list that they are actively in a rally.
-- Frames **are in a rally** if: shuttlecock is in play. Shuttlecock may be out of the frame if it's too high.
-- **Not a rally** if: shuttle is falling to ground, someone is picking up the shuttle, someone is getting a new shuttle off the court, or shuttle is out of sight for more than 5 frames.
-- Rally starts from someone serve the shuttlecock or prepare to receive a serve.
-- Rally ends when the shuttlecock is falling to ground."""
+        "text": (
+            "For each segment, only include frames where the shuttlecock is in play and all players are actively rallying. "
+            "Exclude frames where the rally is clearly paused, players are retrieving the shuttle, or waiting. "
+            "If the shuttle is not visible for more than 6 frames, consider the rally paused. "
+            "A segment MUST start with serving or preparing to receive."
+        )
     },
-    {
-        "type": "input_text",
-        "text": """Frame images are uploaded in the following inputs. Please answer with a JSON list of rallies, each as an object with 'start' and 'end' frame numbers.
-- Only include frames where the shuttlecock is in play and all players are actively rallying.
-- Exclude frames where the rally is clearly paused, players are retrieving the shuttle, or waiting.
-- If the shuttle is not visible for more than 6 frames, consider the rally paused.
-- If you are not sure whether frames belong to the same segment, prefer splitting them into different segments.
-- If there is any short pause or suspected pause, please split into multiple segments.
-- If uncertain, err on the side of splitting into more segments.
-"""
-    }
 ]
 
 # Define the data model for rally information
@@ -177,13 +167,13 @@ class BadmintonAnalysisAgent:
             name="Badminton Rally Detector",
             instructions="""
             You are an expert badminton video analyzer. Your task is to identify rallies in a series of frame images.
-            
-            Definitions:
-            - Frames are in a rally if: shuttlecock is in play. Shuttlecock may be out of the frame if it's too high.
-            - Not a rally if: shuttle is falling to ground, someone is picking up the shuttle, someone is getting a 
-              new shuttle off the court, or shuttle is out of sight for more than 5 frames.
-            - Rally starts from someone serving the shuttlecock or preparing to receive a serve.
-            - Rally ends when the shuttlecock is falling to ground.
+
+            You MUST strictly follow these rules for segmenting rallies:
+            - A segment MUST start with serving or preparing to receive. This rule applies to both your output and the user input.
+            - Frames are in a rally if the shuttlecock is in play (it may be out of frame if too high).
+            - A segment MUST end when the shuttlecock is falling to the ground.
+            - If the shuttle is falling to ground, someone is picking up the shuttle, someone is getting a new shuttle off the court, or the shuttle is out of sight for more than 5 frames, it is NOT a rally.
+            - If you are not sure whether frames belong to the same segment, split them. If there is any short or suspected pause, split into multiple segments. If uncertain, err on the side of splitting into more segments.
             """,
             tools=[],
             model=OpenAIChatCompletionsModel(openai_client=client, model=model_name),
@@ -317,7 +307,21 @@ class BadmintonAnalysisAgent:
                 "end_frame": rally["end_frame"],
                 "frames": [frame for frame in indexed_frames if rally["start_frame"] <= frame[0] <= rally["end_frame"]]
             })
-        
+
+        # Merge consecutive segments if the last frame of previous is the same or one less than the first frame of next
+        if rally_segments:
+            merged_segments = [rally_segments[0]]
+            for seg in rally_segments[1:]:
+                prev = merged_segments[-1]
+                if prev["end_frame"] == seg["start_frame"] or prev["end_frame"] + 1 == seg["start_frame"]:
+                    # Merge segments
+                    prev["end_time"] = seg["end_time"]
+                    prev["end_frame"] = seg["end_frame"]
+                    prev["frames"].extend(seg["frames"])
+                else:
+                    merged_segments.append(seg)
+            rally_segments = merged_segments
+
         return rally_segments
 
 # CLI application
@@ -328,7 +332,6 @@ def analyze(
     video_path: str = typer.Argument(..., help="Path to the badminton video file"),
     output_path: Optional[str] = typer.Option(None, help="Path to save analysis results"),
     sample_rate: int = typer.Option(30, help="Sample every N frames"),
-    min_segment_length: float = typer.Option(3.0, help="Minimum play segment length in seconds"),
 ):
     """
     Analyze a badminton video to identify segments with active play.
@@ -355,18 +358,14 @@ def analyze(
         # Run the analysis asynchronously
         segments = asyncio.run(agent.analyze_video(video_path, sample_rate))
         
-        # Filter segments by minimum length
-        filtered_segments = [segment for segment in segments 
-                            if segment["end_time"] - segment["start_time"] >= min_segment_length]
-        
         # Display and save results
-        typer.echo(f"\nIdentified {len(filtered_segments)} segments of active play:")
+        typer.echo(f"\nIdentified {len(segments)} segments of active play:")
         with open(output_path, "w") as f:
             f.write(f"Badminton Video Analysis Results\n")
             f.write(f"Video: {video_path}\n")
             f.write(f"Analysis Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             
-            for i, segment in enumerate(filtered_segments, 1):
+            for i, segment in enumerate(segments, 1):
                 start_time = segment["start_time"]
                 end_time = segment["end_time"]
                 start_frame = segment["start_frame"]
