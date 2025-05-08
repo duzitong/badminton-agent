@@ -1,0 +1,9 @@
+openai-agents
+opencv-python
+python-dotenv
+numpy
+click
+pillow
+python-multipart
+tqdm
+typer
