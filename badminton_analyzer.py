@@ -159,6 +159,54 @@ def get_frame_by_timestamp_tool(timestamp: float) -> dict:
     """
     return get_frame_by_timestamp(timestamp)
 
+def extract_highlight_frames(video_path: str, start_time: float, end_time: float, num_frames: int = 5) -> list:
+    """
+    Extract highlight frames (with most motion) between start_time and end_time.
+    Returns a list of dicts: [{"timestamp": float, "image_url": str, "detail": "auto"}, ...]
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    start_frame = int(start_time * fps)
+    end_frame = int(end_time * fps)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    prev_gray = None
+    motion_scores = []
+    frames = []
+    for i in range(start_frame, end_frame + 1):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray)
+            score = float(np.sum(diff))
+            motion_scores.append((score, i, frame))
+        prev_gray = gray
+    cap.release()
+    # Sort by motion score, pick top N
+    motion_scores.sort(reverse=True, key=lambda x: x[0])
+    highlights = []
+    for score, idx, frame in motion_scores[:num_frames]:
+        timestamp = idx / fps
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_frame)
+        buffer = BytesIO()
+        pil_img.save(buffer, format="JPEG", quality=80)
+        img_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        highlights.append({"timestamp": timestamp, "image_url": f"data:image/jpeg;base64,{img_b64}", "detail": "auto"})
+    return highlights
+
+@function_tool
+def extract_highlight_frames_tool(start_time: float, end_time: float, num_frames: int = 5) -> list:
+    """
+    Tool: Extract highlight frames (with most motion) between start_time and end_time.
+    Returns a list of dicts: [{"timestamp": float, "image_url": str, "detail": "auto"}, ...]
+    """
+    global VIDEO_PATH
+    return extract_highlight_frames(VIDEO_PATH, start_time, end_time, num_frames)
+
 # Define initial content for badminton rally detection
 init_content = [
     {
@@ -211,6 +259,12 @@ class BadmintonAnalysisAgent:
             For each rally, generate a short, vivid, and engaging commentary in the style of a sports commentator, describing what happens in the rally IN CHINESE (e.g., '双方开局谨慎，连续多拍后由后场劈杀得分').
             Output this commentary in the 'description' field for each rally. Do not explain your reasoning or how you determined the rally boundaries—focus only on describing the on-court action as if you are narrating for an audience.
 
+            IMPORTANT: Only describe what is visible in the provided frames and any additional frames you fetch using the get_frame_by_timestamp_tool or extract_highlight_frames_tool. Do NOT speculate or invent details that are not clearly shown in the frames. If you are uncertain about any part of the rally (such as the start, end, or a key moment), you MUST use these tools to fetch extra frames at or near those timestamps before writing your commentary.
+
+            If you want to focus on the most action-packed or important moments in a segment, you may call extract_highlight_frames_tool for the relevant time range and use those frames for your commentary.
+
+            You are strongly encouraged to fetch additional frames at the start and end of each rally, and at any moment where the action is unclear, to ensure your commentary is accurate and based on real video content.
+
             You MUST strictly follow these rules for segmenting rallies:
             - A segment MUST start with serving or preparing to receive. This rule applies to both your output and the user input.
             - Frames are in a rally if the shuttlecock is in play (it may be out of frame if too high).
@@ -218,7 +272,7 @@ class BadmintonAnalysisAgent:
             - If the shuttle is falling to ground, someone is picking up the shuttle, someone is getting a new shuttle off the court, or the shuttle is out of sight for more than 5 frames, it is NOT a rally.
             - If you are not sure whether frames belong to the same segment, split them. If there is any short or suspected pause, split into multiple segments. If uncertain, err on the side of splitting into more segments.
             """,
-            tools=[get_frame_by_timestamp_tool],
+            tools=[get_frame_by_timestamp_tool, extract_highlight_frames_tool],
             model=OpenAIChatCompletionsModel(openai_client=client, model=model_name),
             output_type=AgentOutputSchema(BadmintonOutput, strict_json_schema=True)
         )
@@ -263,17 +317,22 @@ class BadmintonAnalysisAgent:
             
         return {"rallies": rallies}
 
-    async def analyze_video(self, video_path: str, sample_rate: int = 30) -> List[Dict[str, Any]]:
+    async def analyze_video(self, video_path: str, sample_rate: int = 30, srt_path: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Analyze a badminton video to identify rallies that span across batches.
         
         Args:
             video_path: Path to the video file
             sample_rate: Sample every N frames
-            
+            srt_path: Path to save SRT subtitle file (optional)
+        
         Returns:
             List of rally segments with start and end frame numbers
         """
+        # Set the SRT output path if provided
+        if srt_path is not None:
+            self.srt_output_path = srt_path
+
         # Extract frames from the video
         frame_tuples = extract_frames(video_path, sample_rate)
         
@@ -368,8 +427,13 @@ class BadmintonAnalysisAgent:
                     s = int(t % 60)
                     ms = int((t - int(t)) * 1000)
                     return f"{h:02}:{m:02}:{s:02},{ms:03}"
+                current_time = 0.0
                 for i, seg in enumerate(rally_segments, 1):
-                    srt.write(f"{i}\n{srt_time(seg['start_time'])} --> {srt_time(seg['end_time'])}\n{seg['description']}\n\n")
+                    duration = seg['end_time'] - seg['start_time']
+                    seg_start = current_time
+                    seg_end = current_time + duration
+                    srt.write(f"{i}\n{srt_time(seg_start)} --> {srt_time(seg_end)}\n{seg['description']}\n\n")
+                    current_time = seg_end
 
         # Merge consecutive segments if the last frame of previous is the same or one less than the first frame of next
         if rally_segments:
@@ -397,6 +461,7 @@ def analyze(
     video_path: str = typer.Argument(..., help="Path to the badminton video file"),
     output_path: Optional[str] = typer.Option(None, help="Path to save analysis results"),
     sample_rate: int = typer.Option(30, help="Sample every N frames"),
+    srt_path: Optional[str] = typer.Option(None, help="Path to save SRT subtitle file")
 ):
     global VIDEO_PATH
     VIDEO_PATH = video_path
@@ -415,6 +480,10 @@ def analyze(
         video_name_no_ext = os.path.splitext(video_name)[0]
         output_path = f"{video_name_no_ext}_analysis.txt"
     
+    # Set default srt_path if not provided
+    if srt_path is None:
+        srt_path = output_path.replace(".txt", ".srt")
+    
     # Run the analysis
     typer.echo(f"Analyzing badminton video: {video_path}")
     typer.echo(f"Using Azure OpenAI deployment: {AZURE_OPENAI_DEPLOYMENT}")
@@ -424,11 +493,11 @@ def analyze(
         agent = BadmintonAnalysisAgent()
         
         # Run the analysis asynchronously
-        segments = asyncio.run(agent.analyze_video(video_path, sample_rate))
+        segments = asyncio.run(agent.analyze_video(video_path, sample_rate, srt_path))
         
         # Display and save results
         typer.echo(f"\nIdentified {len(segments)} segments of active play:")
-        with open(output_path, "w") as f, open(output_path.replace(".txt", ".srt"), "w") as srt:
+        with open(output_path, "w") as f:
             f.write(f"Badminton Video Analysis Results\n")
             f.write(f"Video: {video_path}\n")
             f.write(f"Analysis Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
@@ -450,15 +519,6 @@ def analyze(
                 for frame_num, timestamp, _ in sample_frames:
                     f.write(f"  - Frame {frame_num} at {timestamp:.2f}s\n")
                 f.write("\n")
-
-                # Write SRT entry
-                def srt_time(t):
-                    h = int(t // 3600)
-                    m = int((t % 3600) // 60)
-                    s = int(t % 60)
-                    ms = int((t - int(t)) * 1000)
-                    return f"{h:02}:{m:02}:{s:02},{ms:03}"
-                srt.write(f"{i}\n{srt_time(start_time)} --> {srt_time(end_time)}\n{description}\n\n")
         
         typer.echo(f"\nAnalysis results saved to: {output_path}")
         
