@@ -211,7 +211,7 @@ def extract_highlight_frames_tool(start_time: float, end_time: float, num_frames
 init_content = [
     {
         "type": "input_text",
-        "text": "This is a double badminton game, four players are playing. Both forehand and backhand serves are possible. Frames are taken every second. Only look at the closer court."
+        "text": "This is part of a double badminton game, four players are playing. Both forehand and backhand serves are possible. Frames are taken every second. Only look at the closer court."
     },
     {
         "type": "input_text",
@@ -271,6 +271,8 @@ class BadmintonAnalysisAgent:
             - A segment MUST end when the shuttlecock is falling to the ground.
             - If the shuttle is falling to ground, someone is picking up the shuttle, someone is getting a new shuttle off the court, or the shuttle is out of sight for more than 5 frames, it is NOT a rally.
             - If you are not sure whether frames belong to the same segment, split them. If there is any short or suspected pause, split into multiple segments. If uncertain, err on the side of splitting into more segments.
+
+            CHAIN-OF-THOUGHT: For each rally, before writing the final description, think step by step about what is happening in the frames and what evidence you have for the start and end of the rally. If you are unsure, fetch more frames. Only after this reasoning, write the final description in Chinese for the output.
             """,
             tools=[get_frame_by_timestamp_tool, extract_highlight_frames_tool],
             model=OpenAIChatCompletionsModel(openai_client=client, model=model_name),
@@ -436,20 +438,43 @@ class BadmintonAnalysisAgent:
                     current_time = seg_end
 
         # Merge consecutive segments if the last frame of previous is the same or one less than the first frame of next
+        merge_gap = 1.0  # seconds to add for each merge
+        merge_indices = []  # indices where merges happen
         if rally_segments:
             merged_segments = [rally_segments[0]]
-            for seg in rally_segments[1:]:
+            for idx, seg in enumerate(rally_segments[1:], 1):
                 prev = merged_segments[-1]
                 if prev["end_frame"] == seg["start_frame"] or prev["end_frame"] + 1 == seg["start_frame"]:
                     # Merge segments
                     prev["end_time"] = seg["end_time"]
                     prev["end_frame"] = seg["end_frame"]
                     prev["frames"].extend(seg["frames"])
+                    if prev["end_frame"] + 1 == seg["start_frame"]:
+                        merge_indices.append(idx)  # record merge
                 else:
                     merged_segments.append(seg)
-            rally_segments = merged_segments
 
-        return rally_segments
+        # Write SRT file for merged segments, adjusting for merge gaps using merge_indices
+        if rally_segments and srt_path:
+            with open(srt_path, "w") as srt:
+                def srt_time(t):
+                    h = int(t // 3600)
+                    m = int((t % 3600) // 60)
+                    s = int(t % 60)
+                    ms = int((t - int(t)) * 1000)
+                    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+                current_time = 0.0
+                for i, seg in enumerate(rally_segments, 1):
+                    duration = seg['end_time'] - seg['start_time']
+                    seg_start = current_time
+                    seg_end = current_time + duration
+                    srt.write(f"{i}\n{srt_time(seg_start)} --> {srt_time(seg_end)}\n{seg['description']}\n\n")
+                    current_time = seg_end
+                    # Only add 1s gap if this segment was merged with the next (i in merge_indices)
+                    if i in merge_indices:
+                        current_time += merge_gap
+
+        return merged_segments
 
 # CLI application
 app = typer.Typer(help="Badminton video analysis tool using Azure OpenAI")
@@ -508,7 +533,6 @@ def analyze(
                 start_frame = segment["start_frame"]
                 end_frame = segment["end_frame"]
                 duration = end_time - start_time
-                description = segment.get("description", "")
                 
                 segment_info = f"Segment {i}: {start_time:.2f}s - {end_time:.2f}s (Frames: {start_frame}-{end_frame}, Duration: {duration:.2f}s)"
                 typer.echo(segment_info)
