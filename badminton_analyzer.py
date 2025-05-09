@@ -120,6 +120,45 @@ def encode_frame(frame: np.ndarray) -> str:
     pil_img.save(buffer, format="JPEG", quality=80)
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
+def get_frame_by_timestamp(timestamp: float) -> dict:
+    """
+    Extract a single frame from the video at the given timestamp (in seconds).
+    Uses the global VIDEO_PATH set at runtime.
+    Args:
+        timestamp: Time in seconds to extract the frame
+    Returns:
+        A dict in the format of {"type": "input_image", "image_url": ..., "detail": "auto"}
+    """
+    global VIDEO_PATH
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {VIDEO_PATH}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_number = int(timestamp * fps)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise ValueError(f"Could not read frame at {timestamp} seconds (frame {frame_number})")
+    # Encode as base64 image
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    from PIL import Image
+    from io import BytesIO
+    import base64
+    pil_img = Image.fromarray(rgb_frame)
+    buffer = BytesIO()
+    pil_img.save(buffer, format="JPEG", quality=80)
+    img_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    return {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}", "detail": "auto"}
+
+@function_tool
+def get_frame_by_timestamp_tool(timestamp: float) -> dict:
+    """
+    Tool: Extract a single frame from the video at the given timestamp (in seconds).
+    Returns a dict in the format of {"type": "input_image", "image_url": ..., "detail": "auto"}
+    """
+    return get_frame_by_timestamp(timestamp)
+
 # Define initial content for badminton rally detection
 init_content = [
     {
@@ -144,11 +183,12 @@ class RallyInfo:
     start_time: float
     end_frame: int
     end_time: float
+    description: str  # Short description of the rally
 
 @dataclass
 class BadmintonOutput:
     rallies: List[RallyInfo]
-    """A list of rallies with start/end frame numbers and times."""
+    """A list of rallies with start/end frame numbers and times and descriptions."""
 
     reason: str
     """Reason for the analysis, e.g., "Rallies detected in the video."""
@@ -168,6 +208,9 @@ class BadmintonAnalysisAgent:
             instructions="""
             You are an expert badminton video analyzer. Your task is to identify rallies in a series of frame images.
 
+            For each rally, generate a short, vivid, and engaging commentary in the style of a sports commentator, describing what happens in the rally IN CHINESE (e.g., '双方开局谨慎，连续多拍后由后场劈杀得分').
+            Output this commentary in the 'description' field for each rally. Do not explain your reasoning or how you determined the rally boundaries—focus only on describing the on-court action as if you are narrating for an audience.
+
             You MUST strictly follow these rules for segmenting rallies:
             - A segment MUST start with serving or preparing to receive. This rule applies to both your output and the user input.
             - Frames are in a rally if the shuttlecock is in play (it may be out of frame if too high).
@@ -175,7 +218,7 @@ class BadmintonAnalysisAgent:
             - If the shuttle is falling to ground, someone is picking up the shuttle, someone is getting a new shuttle off the court, or the shuttle is out of sight for more than 5 frames, it is NOT a rally.
             - If you are not sure whether frames belong to the same segment, split them. If there is any short or suspected pause, split into multiple segments. If uncertain, err on the side of splitting into more segments.
             """,
-            tools=[],
+            tools=[get_frame_by_timestamp_tool],
             model=OpenAIChatCompletionsModel(openai_client=client, model=model_name),
             output_type=AgentOutputSchema(BadmintonOutput, strict_json_schema=True)
         )
@@ -214,7 +257,8 @@ class BadmintonAnalysisAgent:
                 "start_frame": rally.start_frame,
                 "start_time": rally.start_time,
                 "end_frame": rally.end_frame,
-                "end_time": rally.end_time
+                "end_time": rally.end_time,
+                "description": rally.description
             })
             
         return {"rallies": rallies}
@@ -305,8 +349,27 @@ class BadmintonAnalysisAgent:
                 "end_time": rally["end_time"],
                 "start_frame": rally["start_frame"],
                 "end_frame": rally["end_frame"],
+                "description": rally["description"],
                 "frames": [frame for frame in indexed_frames if rally["start_frame"] <= frame[0] <= rally["end_frame"]]
             })
+
+        # Write SRT file for unmerged segments
+        srt_path = None
+        if rally_segments and hasattr(self, 'srt_output_path') and self.srt_output_path:
+            srt_path = self.srt_output_path
+        elif rally_segments:
+            # fallback: use default naming
+            srt_path = 'unmerged_segments.srt'
+        if rally_segments and srt_path:
+            with open(srt_path, "w") as srt:
+                def srt_time(t):
+                    h = int(t // 3600)
+                    m = int((t % 3600) // 60)
+                    s = int(t % 60)
+                    ms = int((t - int(t)) * 1000)
+                    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+                for i, seg in enumerate(rally_segments, 1):
+                    srt.write(f"{i}\n{srt_time(seg['start_time'])} --> {srt_time(seg['end_time'])}\n{seg['description']}\n\n")
 
         # Merge consecutive segments if the last frame of previous is the same or one less than the first frame of next
         if rally_segments:
@@ -327,12 +390,17 @@ class BadmintonAnalysisAgent:
 # CLI application
 app = typer.Typer(help="Badminton video analysis tool using Azure OpenAI")
 
+VIDEO_PATH = None
+
 @app.command()
 def analyze(
     video_path: str = typer.Argument(..., help="Path to the badminton video file"),
     output_path: Optional[str] = typer.Option(None, help="Path to save analysis results"),
     sample_rate: int = typer.Option(30, help="Sample every N frames"),
 ):
+    global VIDEO_PATH
+    VIDEO_PATH = video_path
+
     """
     Analyze a badminton video to identify segments with active play.
     """
@@ -360,7 +428,7 @@ def analyze(
         
         # Display and save results
         typer.echo(f"\nIdentified {len(segments)} segments of active play:")
-        with open(output_path, "w") as f:
+        with open(output_path, "w") as f, open(output_path.replace(".txt", ".srt"), "w") as srt:
             f.write(f"Badminton Video Analysis Results\n")
             f.write(f"Video: {video_path}\n")
             f.write(f"Analysis Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
@@ -371,6 +439,7 @@ def analyze(
                 start_frame = segment["start_frame"]
                 end_frame = segment["end_frame"]
                 duration = end_time - start_time
+                description = segment.get("description", "")
                 
                 segment_info = f"Segment {i}: {start_time:.2f}s - {end_time:.2f}s (Frames: {start_frame}-{end_frame}, Duration: {duration:.2f}s)"
                 typer.echo(segment_info)
@@ -380,8 +449,16 @@ def analyze(
                 sample_frames = segment["frames"][:3] + segment["frames"][-3:] if len(segment["frames"]) > 6 else segment["frames"]
                 for frame_num, timestamp, _ in sample_frames:
                     f.write(f"  - Frame {frame_num} at {timestamp:.2f}s\n")
-                
                 f.write("\n")
+
+                # Write SRT entry
+                def srt_time(t):
+                    h = int(t // 3600)
+                    m = int((t % 3600) // 60)
+                    s = int(t % 60)
+                    ms = int((t - int(t)) * 1000)
+                    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+                srt.write(f"{i}\n{srt_time(start_time)} --> {srt_time(end_time)}\n{description}\n\n")
         
         typer.echo(f"\nAnalysis results saved to: {output_path}")
         

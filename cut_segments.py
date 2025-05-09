@@ -36,24 +36,32 @@ def cut_video_segments(video_path, segments, output_dir):
         segment_files.append(output_path)
     return segment_files
 
-def concat_segments(segment_files, output_path):
+def concat_segments(segment_files, output_path, srt_path=None):
     # Create a temporary file list for ffmpeg concat
     list_path = os.path.join(os.path.dirname(output_path), "segments.txt")
     with open(list_path, "w") as f:
         for seg in segment_files:
             f.write(f"file '{os.path.abspath(seg)}'\n")
-    # Run ffmpeg concat with re-encoding
+    # Run ffmpeg concat with re-encoding, and add subtitles if srt_path is provided
     cmd = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", list_path, "-c:v", "libx264", "-c:a", "aac", "-strict", "-2", output_path
+        "-i", list_path, "-c:v", "libx264", "-c:a", "aac", "-strict", "-2"
     ]
-    print(f"Combining segments into {output_path}")
+    if srt_path:
+        cmd.extend(["-vf", f"subtitles={srt_path}"])
+    cmd.append(output_path)
+    print(f"Combining segments into {output_path}" + (f" with subtitles {srt_path}" if srt_path else ""))
     subprocess.run(cmd, check=True)
 
 if __name__ == "__main__":
     segments = parse_segments(ANALYSIS_FILE)
     print(f"Found {len(segments)} segments.")
     segment_files = cut_video_segments(VIDEO_FILE, segments, OUTPUT_DIR)
+    srt_path = ANALYSIS_FILE.replace('.txt', '.srt')
     combined_path = os.path.join(OUTPUT_DIR, "combined.mp4")
-    concat_segments(segment_files, combined_path)
-    print(f"Combined video saved to {combined_path}")
+    if os.path.exists(srt_path):
+        concat_segments(segment_files, combined_path, srt_path)
+        print(f"Combined video with subtitles saved to {combined_path}")
+    else:
+        concat_segments(segment_files, combined_path)
+        print(f"Combined video saved to {combined_path}")
